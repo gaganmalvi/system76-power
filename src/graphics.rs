@@ -65,6 +65,9 @@ alias nvidia-drm off
 alias nvidia-modeset off
 "#;
 
+// Systems that cannot use other sleep options
+static SYSTEM_SLEEP_EMPTY: &[u8] = b"";
+
 // Systems using S0ix must enable S0ix-based power management.
 static SYSTEM_SLEEP_S0IX: &[u8] = br#"# Preserve video memory through suspend
 options nvidia NVreg_EnableS0ixPowerManagement=1
@@ -363,25 +366,26 @@ impl Graphics {
     }
 
     fn get_nvidia_device(id: u16) -> Result<NvidiaDevice, GraphicsDeviceError> {
-        let docs: Vec<path::PathBuf> = fs::read_dir("/usr/share/doc")
+        let supported_gpus: Vec<path::PathBuf> = fs::read_dir("/usr/share/doc")
             .map_err(|e| {
                 GraphicsDeviceError::Json(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
             })?
             .filter_map(Result::ok)
             .map(|f| f.path())
             .filter(|f| f.to_str().unwrap_or_default().contains("nvidia-driver-"))
+            .map(|f| f.join("supported-gpus.json"))
+            .filter(|f| f.exists())
             .collect();
 
         // There should be only 1 driver version installed.
-        if docs.len() != 1 {
+        if supported_gpus.len() != 1 {
             return Err(GraphicsDeviceError::Json(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "NVIDIA drivers misconfigured",
             )));
         }
 
-        let supported_gpus = docs[0].join("supported-gpus.json");
-        let raw = fs::read_to_string(supported_gpus).map_err(GraphicsDeviceError::Json)?;
+        let raw = fs::read_to_string(&supported_gpus[0]).map_err(GraphicsDeviceError::Json)?;
         let gpus: SupportedGpus = serde_json::from_str(&raw).map_err(|e| {
             GraphicsDeviceError::Json(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
         })?;
@@ -423,7 +427,13 @@ impl Graphics {
             .map(|s| s.trim().to_string())?;
         let blacklisted = DEFAULT_INTEGRATED.contains(&product.as_str());
 
-        let runtimepm = self.gpu_supports_runtimepm().unwrap_or_default();
+        let runtimepm = match self.gpu_supports_runtimepm() {
+            Ok(ok) => ok,
+            Err(err) => {
+                log::warn!("could not determine GPU runtimepm support: {}", err);
+                false
+            }
+        };
 
         // Only default to hybrid on System76 models
         let vendor = fs::read_to_string("/sys/class/dmi/id/sys_vendor")
@@ -484,14 +494,14 @@ impl Graphics {
         log::info!("Setting {} to {}", PRIME_DISCRETE_PATH, mode);
         Self::set_prime_discrete(mode)?;
 
-        let supports_gc6 = {
+        let bonw15_hack = {
             let dmi_vendor =
                 fs::read_to_string("/sys/class/dmi/id/sys_vendor").unwrap_or(String::new());
             let dmi_model =
                 fs::read_to_string("/sys/class/dmi/id/product_version").unwrap_or(String::new());
             match (dmi_vendor.trim(), dmi_model.trim()) {
-                ("System76", "bonw15") => false,
-                _ => true,
+                ("System76", "bonw15") => true,
+                _ => false,
             }
         };
 
@@ -508,17 +518,17 @@ impl Graphics {
             let text = match vendor {
                 GraphicsMode::Integrated => MODPROBE_INTEGRATED,
                 GraphicsMode::Compute => {
-                    if supports_gc6 {
-                        MODPROBE_COMPUTE
-                    } else {
+                    if bonw15_hack {
                         MODPROBE_COMPUTE_NO_GC6
+                    } else {
+                        MODPROBE_COMPUTE
                     }
                 }
                 GraphicsMode::Hybrid => {
-                    if supports_gc6 {
-                        MODPROBE_HYBRID
-                    } else {
+                    if bonw15_hack {
                         MODPROBE_HYBRID_NO_GC6
+                    } else {
+                        MODPROBE_HYBRID
                     }
                 }
                 GraphicsMode::Discrete => MODPROBE_NVIDIA,
@@ -536,7 +546,13 @@ impl Graphics {
                     .unwrap_or_default()
                     .contains("[s2idle]");
 
-                let sleep = if s0ix { SYSTEM_SLEEP_S0IX } else { SYSTEM_SLEEP_S3 };
+                let (sleep, action) = if bonw15_hack {
+                    (SYSTEM_SLEEP_EMPTY, "disable")
+                } else if s0ix {
+                    (SYSTEM_SLEEP_S0IX, "enable")
+                } else {
+                    (SYSTEM_SLEEP_S3, "enable")
+                };
 
                 // We should also check if the GPU supports Video Memory Self
                 // Refresh, but that requires already being in hybrid or nvidia
@@ -545,6 +561,27 @@ impl Graphics {
                 file.write_all(sleep)
                     .and_then(|_| file.sync_all())
                     .map_err(GraphicsDeviceError::ModprobeFileWrite)?;
+
+                for service in
+                    &["nvidia-hibernate.service", "nvidia-resume.service", "nvidia-suspend.service"]
+                {
+                    let status = process::Command::new(SYSTEMCTL_CMD)
+                        .arg(action)
+                        .arg(service)
+                        .status()
+                        .map_err(|why| GraphicsDeviceError::Command { cmd: SYSTEMCTL_CMD, why })?;
+
+                    if !status.success() {
+                        // Error is ignored in case this service is removed
+                        log::warn!(
+                            "systemctl {} {}: failed with {} (not an error if service does not \
+                             exist!)",
+                            action,
+                            service,
+                            status
+                        );
+                    }
+                }
             }
         }
 
